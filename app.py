@@ -7,7 +7,7 @@ in AI+Materials and Computer Vision.
 import streamlit as st
 import json
 import time
-from agent import create_client, run_full_search
+from agent import create_client, create_clients, run_full_search
 from config import SEARCH_CATEGORIES, AVAILABLE_MODELS, DEFAULT_MODEL
 
 # ──────────────── Page Configuration ────────────────
@@ -398,6 +398,30 @@ section[data-testid="stSidebar"] .stMarkdown label {
     border-radius: 10px !important;
     font-weight: 700 !important;
 }
+/* ── Activity Log ── */
+.activity-log-entry {
+    padding: 0.2rem 0;
+    border-bottom: 1px solid rgba(102,126,234,0.06);
+}
+
+.activity-log-entry:last-child {
+    border-bottom: none;
+}
+
+/* Ensure log scrolls properly */
+div[style*="max-height:300px"] {
+    scrollbar-width: thin;
+    scrollbar-color: #667eea #1a1a2e;
+}
+
+div[style*="max-height:300px"]::-webkit-scrollbar {
+    width: 5px;
+}
+
+div[style*="max-height:300px"]::-webkit-scrollbar-thumb {
+    background: rgba(102,126,234,0.4);
+    border-radius: 3px;
+}
 
 </style>
 """,
@@ -641,12 +665,16 @@ with st.sidebar:
     st.markdown("## ⚙️ Configuration")
     st.markdown("---")
 
-    api_key = st.text_input(
-        "🔑 Gemini API Key",
-        type="password",
-        help="Get your free API key from https://aistudio.google.com/apikey",
-        placeholder="Enter your Gemini API key...",
+    api_keys_text = st.text_area(
+        "🔑 Gemini API Keys",
+        height=100,
+        help="Paste one or more API keys, one per line. More keys = more daily quota!",
+        placeholder="Paste API key(s) here, one per line...\nKey 1\nKey 2 (optional)\nKey 3 (optional)",
     )
+
+    # Parse keys
+    api_keys = [k.strip() for k in api_keys_text.strip().split("\n") if k.strip()] if api_keys_text.strip() else []
+    num_keys = len(api_keys)
 
     st.markdown("### 🤖 Model Selection")
     selected_model_name = st.selectbox(
@@ -657,11 +685,13 @@ with st.sidebar:
     )
     selected_model_id = AVAILABLE_MODELS[selected_model_name]
 
+    key_color = "#38ef7d" if num_keys > 1 else "#667eea"
     st.markdown(
         f"""
     <div style="background:rgba(102,126,234,0.08);border:1px solid rgba(102,126,234,0.2);border-radius:10px;padding:0.6rem 0.8rem;margin:0.3rem 0 0.8rem;font-size:0.78rem;color:#a8b2d1;">
-        🤖 Using: <strong style="color:#f093fb;">{selected_model_name}</strong><br>
-        <code style="font-size:0.72rem;color:#667eea;">{selected_model_id}</code>
+        🤖 Model: <strong style="color:#f093fb;">{selected_model_name}</strong><br>
+        🔑 Keys loaded: <strong style="color:{key_color};">{num_keys}</strong>
+        {' — <span style="color:#38ef7d;">multi-key rotation active!</span>' if num_keys > 1 else ''}
     </div>
     """,
         unsafe_allow_html=True,
@@ -672,7 +702,8 @@ with st.sidebar:
     <div style="background:rgba(102,126,234,0.08);border:1px solid rgba(102,126,234,0.2);border-radius:10px;padding:0.8rem;margin:0.8rem 0;font-size:0.82rem;color:#a8b2d1;">
         💡 <strong style="color:#667eea;">Free Tier</strong>: Get your API key from 
         <a href="https://aistudio.google.com/apikey" target="_blank" style="color:#667eea;">Google AI Studio</a>. 
-        No credit card required.
+        No credit card required.<br>
+        <span style="color:#38ef7d;">💪 Pro tip:</span> Add <strong>2-3 keys</strong> (from different Google accounts) to multiply your daily quota!
     </div>
     """,
         unsafe_allow_html=True,
@@ -704,7 +735,7 @@ with st.sidebar:
 
 # ──────────────── Main Content ────────────────
 
-if not api_key and not search_clicked:
+if not api_keys and not search_clicked:
     # Show welcome state
     st.markdown(
         """
@@ -756,25 +787,27 @@ if not api_key and not search_clicked:
             unsafe_allow_html=True,
         )
 
-elif search_clicked and not api_key:
+elif search_clicked and not api_keys:
     st.markdown(
-        '<div class="error-box">⚠️ Please enter your Gemini API key in the sidebar to start searching.</div>',
+        '<div class="error-box">⚠️ Please enter at least one Gemini API key in the sidebar to start searching.</div>',
         unsafe_allow_html=True,
     )
 
-elif search_clicked and api_key:
+elif search_clicked and api_keys:
     if not selected_categories:
         st.markdown(
             '<div class="error-box">⚠️ Please select at least one search category from the sidebar.</div>',
             unsafe_allow_html=True,
         )
     else:
-        # Initialize client
+        # Initialize clients (supports multiple keys)
         try:
-            client = create_client(api_key)
+            clients = create_clients(api_keys)
+            if not clients:
+                raise ValueError("No valid API keys provided")
         except Exception as e:
             st.markdown(
-                f'<div class="error-box">❌ Failed to initialize Gemini client: {e}</div>',
+                f'<div class="error-box">❌ Failed to initialize Gemini client(s): {e}</div>',
                 unsafe_allow_html=True,
             )
             st.stop()
@@ -786,7 +819,49 @@ elif search_clicked and api_key:
         # Progress tracking
         total = len(selected_categories)
         progress_bar = st.progress(0, text="Initializing search agent...")
-        status_placeholder = st.empty()
+
+        # ── Real-time Activity Log ──
+        activity_log_container = st.container()
+        with activity_log_container:
+            st.markdown(
+                """
+            <div style="background:rgba(102,126,234,0.06);border:1px solid rgba(102,126,234,0.15);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;">
+                <span style="font-size:0.9rem;font-weight:700;color:#e6f1ff;">📋 Agent Activity Log</span>
+                <span style="font-size:0.75rem;color:#8892b0;margin-left:0.5rem;">Real-time updates</span>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
+            log_placeholder = st.empty()
+
+        # Log state
+        activity_entries = []
+
+        def add_log(message: str, category_name: str = ""):
+            """Add a timestamped entry to the activity log."""
+            from datetime import datetime
+            ts = datetime.now().strftime("%H:%M:%S")
+            prefix = f"**[{category_name}]** " if category_name else ""
+            activity_entries.append(f"`{ts}` {prefix}{message}")
+            # Render the log (show last 20 entries to keep it readable)
+            log_lines = activity_entries[-20:]
+            log_md = "\n\n".join(log_lines)
+            log_placeholder.markdown(
+                f'<div style="background:rgba(15,12,41,0.8);border:1px solid rgba(102,126,234,0.1);'
+                f'border-radius:10px;padding:1rem;max-height:300px;overflow-y:auto;'
+                f'font-size:0.82rem;line-height:1.8;color:#a8b2d1;">{_md_to_html(log_md)}</div>',
+                unsafe_allow_html=True,
+            )
+
+        def _md_to_html(md: str) -> str:
+            """Minimal markdown to HTML for log display."""
+            import re as _re
+            html = md.replace("\n\n", "<br>")
+            # Bold
+            html = _re.sub(r'\*\*(.+?)\*\*', r'<strong style="color:#e6f1ff;">\1</strong>', html)
+            # Code/timestamp
+            html = _re.sub(r'`(.+?)`', r'<code style="color:#667eea;font-size:0.75rem;">\1</code>', html)
+            return html
 
         from agent import (
             search_professors_materials,
@@ -805,6 +880,9 @@ elif search_clicked and api_key:
             "internships": search_internships,
         }
 
+        add_log(f"🚀 Starting search with **{selected_model_name}** | {num_keys} API key(s) loaded")
+        add_log(f"📋 {total} categories queued: {', '.join(category_labels[c] for c in selected_categories)}")
+
         for i, category in enumerate(selected_categories):
             label = category_labels.get(category, category)
             progress_bar.progress(
@@ -812,27 +890,38 @@ elif search_clicked and api_key:
                 text=f"🔍 Searching: {label}... ({i+1}/{total})",
             )
 
+            add_log(f"🔍 **Starting search:** {label} ({i+1}/{total})")
+
+            # Create a status callback that writes to our activity log
+            def make_callback(cat_label):
+                def callback(msg):
+                    add_log(msg, cat_label)
+                return callback
+
             with st.spinner(f"🌐 Agent is surfing the web for {label}..."):
-                result = fn_map[category](client, model=selected_model_id)
+                result = fn_map[category](
+                    clients,
+                    model=selected_model_id,
+                    status_callback=make_callback(label),
+                )
                 all_results[category] = result
 
-                # Show which model was actually used (may differ if fallback happened)
-                model_used = result.get("_model_used", selected_model_id)
-                if model_used != selected_model_id and "error" not in result:
-                    status_placeholder.info(f"ℹ️ {label} was fetched using fallback model: **{model_used}**")
+                if "error" in result:
+                    add_log(f"❌ **Failed:** {result['error'][:100]}", label)
 
             # Cooldown between searches to avoid rate limits
             if i < len(selected_categories) - 1:
+                add_log(f"⏳ Cooling down **{SEARCH_DELAY}s** before next search...")
                 progress_bar.progress(
                     (i + 0.5) / total,
                     text=f"⏳ Cooling down {SEARCH_DELAY}s to stay under rate limits...",
                 )
                 time.sleep(SEARCH_DELAY)
 
+        add_log("🏁 **All searches complete!**")
         progress_bar.progress(1.0, text="✅ Search complete!")
-        time.sleep(0.5)
+        time.sleep(1)
         progress_bar.empty()
-        status_placeholder.empty()
 
         # Store results in session
         st.session_state["results"] = all_results

@@ -1,9 +1,10 @@
 """
 Research Finder Agent - Core logic using Gemini API with Google Search grounding.
 
-Uses Gemini 2.0 Flash (free tier) with Google Search to find:
-- Professors in AI+Materials/Ceramics and Computer Vision
-- PhD students, Labs, and Internship opportunities
+Supports:
+- Multiple API key rotation (each free key has its own daily quota)
+- Automatic model fallback
+- Exponential backoff on per-minute rate limits
 """
 
 import json
@@ -19,7 +20,12 @@ def create_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def search_professors_materials(client: genai.Client, model: str = None) -> dict:
+def create_clients(api_keys: list[str]) -> list[genai.Client]:
+    """Create multiple Gemini clients from a list of API keys."""
+    return [genai.Client(api_key=key.strip()) for key in api_keys if key.strip()]
+
+
+def search_professors_materials(clients, model: str = None, status_callback=None) -> dict:
     """Search for professors working on AI integration in materials/ceramics."""
 
     prompt = f"""
@@ -67,10 +73,10 @@ Search Google Scholar, university websites, and research group pages to find acc
 Return ONLY valid JSON, no additional text before or after the JSON.
 """
 
-    return _execute_search(client, prompt, model)
+    return _execute_search(clients, prompt, model, _status_callback=status_callback)
 
 
-def search_professors_cv(client: genai.Client, model: str = None) -> dict:
+def search_professors_cv(clients, model: str = None, status_callback=None) -> dict:
     """Search for Computer Vision professors who accept interdisciplinary students."""
 
     prompt = f"""
@@ -119,10 +125,10 @@ Search Google Scholar, university websites, and research group pages for accurat
 Return ONLY valid JSON, no additional text before or after the JSON.
 """
 
-    return _execute_search(client, prompt, model)
+    return _execute_search(clients, prompt, model, _status_callback=status_callback)
 
 
-def search_phd_students(client: genai.Client, model: str = None) -> dict:
+def search_phd_students(clients, model: str = None, status_callback=None) -> dict:
     """Search for exceptional PhD students in AI+Materials and Computer Vision."""
 
     prompt = f"""
@@ -161,10 +167,10 @@ Provide the following in STRICT JSON format:
 Return ONLY valid JSON, no additional text before or after.
 """
 
-    return _execute_search(client, prompt, model)
+    return _execute_search(clients, prompt, model, _status_callback=status_callback)
 
 
-def search_labs(client: genai.Client, model: str = None) -> dict:
+def search_labs(clients, model: str = None, status_callback=None) -> dict:
     """Search for renowned research labs in AI+Materials and Computer Vision."""
 
     prompt = f"""
@@ -205,10 +211,10 @@ Include labs like:
 Return ONLY valid JSON, no additional text before or after.
 """
 
-    return _execute_search(client, prompt, model)
+    return _execute_search(clients, prompt, model, _status_callback=status_callback)
 
 
-def search_internships(client: genai.Client, model: str = None) -> dict:
+def search_internships(clients, model: str = None, status_callback=None) -> dict:
     """Search for research internship opportunities."""
 
     prompt = f"""
@@ -254,7 +260,7 @@ Include programs like:
 Return ONLY valid JSON, no additional text before or after.
 """
 
-    return _execute_search(client, prompt, model)
+    return _execute_search(clients, prompt, model, _status_callback=status_callback)
 
 
 def _extract_retry_delay(error_msg: str) -> float:
@@ -265,6 +271,12 @@ def _extract_retry_delay(error_msg: str) -> float:
     return 10.0  # default 10s
 
 
+def _is_daily_quota_exhausted(error_msg: str) -> bool:
+    """Check if the error is a DAILY quota exhaustion (not recoverable by waiting)."""
+    # Daily quota errors have 'limit: 0' or 'PerDay' in the message
+    return ('limit: 0' in error_msg) or ('PerDay' in error_msg)
+
+
 def _get_fallback_models(primary_model: str) -> list[str]:
     """Get a list of fallback model IDs, excluding the primary."""
     all_ids = list(AVAILABLE_MODELS.values())
@@ -272,95 +284,149 @@ def _get_fallback_models(primary_model: str) -> list[str]:
 
 
 def _execute_search(
-    client: genai.Client,
+    clients,
     prompt: str,
     model: str = None,
-    max_retries: int = 3,
+    max_retries: int = 2,
     _status_callback=None,
 ) -> dict:
     """Execute a search query using Gemini with Google Search grounding.
 
-    Includes:
-    - Exponential backoff retry on rate-limit (429) errors
-    - Automatic fallback to other models if the selected one is exhausted
+    Supports:
+    - Multiple API keys (clients): rotates to next key when one is exhausted
+    - Model fallback: tries other models if the selected one fails
+    - Exponential backoff on per-minute rate limits
+    - Skips retries for daily quota exhaustion (moves to next key immediately)
     """
+    # Normalize to list of clients
+    if isinstance(clients, genai.Client):
+        client_list = [clients]
+    else:
+        client_list = list(clients)
+
     primary_model = model or AVAILABLE_MODELS[DEFAULT_MODEL]
     models_to_try = [primary_model] + _get_fallback_models(primary_model)
 
     last_error = None
 
-    for model_id in models_to_try:
-        for attempt in range(max_retries):
-            try:
-                if _status_callback:
-                    if attempt > 0:
-                        _status_callback(f"⏳ Retry {attempt}/{max_retries} with {model_id}...")
-                    elif model_id != primary_model:
-                        _status_callback(f"🔄 Falling back to {model_id}...")
+    for key_idx, client in enumerate(client_list):
+        key_label = f"Key {key_idx + 1}/{len(client_list)}"
 
-                response = client.models.generate_content(
-                    model=model_id,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        tools=[types.Tool(google_search=types.GoogleSearch())],
-                        temperature=0.3,
-                    ),
-                )
-
-                # Extract text from response
-                text = response.text
-                if not text:
-                    return {"error": "Empty response from Gemini API"}
-
-                # Parse JSON from response
-                parsed = _extract_json(text)
-
-                # Extract grounding sources if available
-                sources = []
-                if response.candidates and response.candidates[0].grounding_metadata:
-                    gm = response.candidates[0].grounding_metadata
-                    if gm.grounding_chunks:
-                        for chunk in gm.grounding_chunks:
-                            if chunk.web:
-                                sources.append(
-                                    {"title": chunk.web.title or "", "url": chunk.web.uri or ""}
-                                )
-
-                if parsed:
-                    parsed["_sources"] = sources
-                    parsed["_model_used"] = model_id
-                    return parsed
-                else:
-                    return {"error": "Could not parse response", "raw_text": text[:2000]}
-
-            except Exception as e:
-                error_str = str(e)
-                last_error = error_str
-
-                # Check if it's a rate-limit (429) error
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    retry_delay = _extract_retry_delay(error_str)
-                    # Exponential backoff: base delay * 2^attempt
-                    wait_time = max(retry_delay, 10.0) * (2 ** attempt)
-                    # Cap at 60 seconds
-                    wait_time = min(wait_time, 60.0)
-
+        for model_id in models_to_try:
+            for attempt in range(max_retries):
+                try:
+                    # Status: starting attempt
                     if _status_callback:
-                        _status_callback(
-                            f"⚠️ Rate limited on {model_id}. Waiting {wait_time:.0f}s before retry {attempt+1}/{max_retries}..."
-                        )
+                        if attempt == 0 and model_id == primary_model:
+                            _status_callback(
+                                f"🌐 Sending request to **{model_id}**"
+                                + (f" ({key_label})" if len(client_list) > 1 else "")
+                            )
+                        elif attempt > 0:
+                            _status_callback(
+                                f"🔄 Retry {attempt}/{max_retries} on **{model_id}**"
+                                + (f" ({key_label})" if len(client_list) > 1 else "")
+                            )
+                        elif model_id != primary_model:
+                            _status_callback(
+                                f"� Trying fallback model **{model_id}**"
+                                + (f" ({key_label})" if len(client_list) > 1 else "")
+                            )
 
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    # Non-rate-limit error, don't retry
-                    return {"error": error_str}
+                    response = client.models.generate_content(
+                        model=model_id,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            tools=[types.Tool(google_search=types.GoogleSearch())],
+                            temperature=0.3,
+                        ),
+                    )
 
-        # If all retries exhausted for this model, try next model
-        if _status_callback:
-            _status_callback(f"❌ {model_id} exhausted. Trying next model...")
+                    # Status: got response
+                    if _status_callback:
+                        _status_callback("📥 Response received, parsing results...")
 
-    return {"error": f"All models exhausted after retries. Last error: {last_error}"}
+                    # Extract text from response
+                    text = response.text
+                    if not text:
+                        if _status_callback:
+                            _status_callback("⚠️ Empty response received")
+                        return {"error": "Empty response from Gemini API"}
+
+                    # Parse JSON from response
+                    parsed = _extract_json(text)
+
+                    # Extract grounding sources if available
+                    sources = []
+                    if response.candidates and response.candidates[0].grounding_metadata:
+                        gm = response.candidates[0].grounding_metadata
+                        if gm.grounding_chunks:
+                            for chunk in gm.grounding_chunks:
+                                if chunk.web:
+                                    sources.append(
+                                        {"title": chunk.web.title or "", "url": chunk.web.uri or ""}
+                                    )
+
+                    if parsed:
+                        parsed["_sources"] = sources
+                        parsed["_model_used"] = model_id
+                        parsed["_key_used"] = key_idx + 1
+
+                        # Count results
+                        n_results = 0
+                        for v in parsed.values():
+                            if isinstance(v, list):
+                                n_results = len(v)
+                                break
+
+                        if _status_callback:
+                            _status_callback(
+                                f"✅ **{n_results} results** found via {model_id}"
+                                + (f" ({key_label})" if len(client_list) > 1 else "")
+                                + (f" | {len(sources)} sources cited" if sources else "")
+                            )
+                        return parsed
+                    else:
+                        if _status_callback:
+                            _status_callback("⚠️ Could not parse JSON from response")
+                        return {"error": "Could not parse response", "raw_text": text[:2000]}
+
+                except Exception as e:
+                    error_str = str(e)
+                    last_error = error_str
+
+                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                        # Daily quota exhausted → skip retries, try next key/model
+                        if _is_daily_quota_exhausted(error_str):
+                            if _status_callback:
+                                _status_callback(
+                                    f"🚫 {key_label} **daily quota exhausted** for {model_id} — skipping"
+                                )
+                            break  # break retry loop → try next model
+
+                        # Per-minute rate limit → wait and retry
+                        retry_delay = _extract_retry_delay(error_str)
+                        wait_time = min(max(retry_delay, 10.0) * (2 ** attempt), 60.0)
+
+                        if _status_callback:
+                            _status_callback(
+                                f"⏳ Rate limited on {model_id}. Waiting **{wait_time:.0f}s** before retry..."
+                            )
+
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        if _status_callback:
+                            _status_callback(f"❌ Error: {error_str[:120]}")
+                        return {"error": error_str}
+
+        # All models exhausted for this key
+        if _status_callback and key_idx < len(client_list) - 1:
+            _status_callback(f"🔑 {key_label} fully exhausted. **Rotating to next API key...**")
+
+    if _status_callback:
+        _status_callback("❌ All API keys and models exhausted")
+    return {"error": f"All API keys and models exhausted. Last error: {last_error}"}
 
 
 def _extract_json(text: str) -> dict | None:
@@ -393,7 +459,7 @@ SEARCH_DELAY = 12
 
 
 def run_full_search(
-    client: genai.Client,
+    clients,
     categories: list[str] = None,
     model: str = None,
     status_callback=None,
@@ -413,7 +479,7 @@ def run_full_search(
     results = {}
     for i, category in enumerate(categories):
         if category in search_functions:
-            results[category] = search_functions[category](client, model=model)
+            results[category] = search_functions[category](clients, model=model)
             # Add delay between searches to stay under rate limits
             if i < len(categories) - 1:
                 if status_callback:
