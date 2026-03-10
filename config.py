@@ -3,7 +3,12 @@ Configuration for the Research Finder Agent.
 """
 
 # Gemini Model Configuration
-GEMINI_MODEL = "gemini-3-flash-preview"  # Free tier model with Google Search grounding
+AVAILABLE_MODELS = {
+    "Gemini 3 Flash (Preview)": "gemini-3-flash-preview",
+    "Gemini 3 Pro (Preview)": "gemini-3-pro-preview",
+    "Gemini 2.0 Flash": "gemini-2.0-flash",
+}
+DEFAULT_MODEL = "Gemini 3 Flash (Preview)"
 
 # Search Categories
 SEARCH_CATEGORIES = {

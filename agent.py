@@ -10,7 +10,7 @@ import json
 import re
 from google import genai
 from google.genai import types
-from config import GEMINI_MODEL, QUALITY_CRITERIA
+from config import AVAILABLE_MODELS, DEFAULT_MODEL, QUALITY_CRITERIA
 
 
 def create_client(api_key: str) -> genai.Client:
@@ -18,7 +18,7 @@ def create_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def search_professors_materials(client: genai.Client) -> dict:
+def search_professors_materials(client: genai.Client, model: str = None) -> dict:
     """Search for professors working on AI integration in materials/ceramics."""
 
     prompt = f"""
@@ -66,10 +66,10 @@ Search Google Scholar, university websites, and research group pages to find acc
 Return ONLY valid JSON, no additional text before or after the JSON.
 """
 
-    return _execute_search(client, prompt)
+    return _execute_search(client, prompt, model)
 
 
-def search_professors_cv(client: genai.Client) -> dict:
+def search_professors_cv(client: genai.Client, model: str = None) -> dict:
     """Search for Computer Vision professors who accept interdisciplinary students."""
 
     prompt = f"""
@@ -118,10 +118,10 @@ Search Google Scholar, university websites, and research group pages for accurat
 Return ONLY valid JSON, no additional text before or after the JSON.
 """
 
-    return _execute_search(client, prompt)
+    return _execute_search(client, prompt, model)
 
 
-def search_phd_students(client: genai.Client) -> dict:
+def search_phd_students(client: genai.Client, model: str = None) -> dict:
     """Search for exceptional PhD students in AI+Materials and Computer Vision."""
 
     prompt = f"""
@@ -160,10 +160,10 @@ Provide the following in STRICT JSON format:
 Return ONLY valid JSON, no additional text before or after.
 """
 
-    return _execute_search(client, prompt)
+    return _execute_search(client, prompt, model)
 
 
-def search_labs(client: genai.Client) -> dict:
+def search_labs(client: genai.Client, model: str = None) -> dict:
     """Search for renowned research labs in AI+Materials and Computer Vision."""
 
     prompt = f"""
@@ -204,10 +204,10 @@ Include labs like:
 Return ONLY valid JSON, no additional text before or after.
 """
 
-    return _execute_search(client, prompt)
+    return _execute_search(client, prompt, model)
 
 
-def search_internships(client: genai.Client) -> dict:
+def search_internships(client: genai.Client, model: str = None) -> dict:
     """Search for research internship opportunities."""
 
     prompt = f"""
@@ -253,14 +253,15 @@ Include programs like:
 Return ONLY valid JSON, no additional text before or after.
 """
 
-    return _execute_search(client, prompt)
+    return _execute_search(client, prompt, model)
 
 
-def _execute_search(client: genai.Client, prompt: str) -> dict:
+def _execute_search(client: genai.Client, prompt: str, model: str = None) -> dict:
     """Execute a search query using Gemini with Google Search grounding."""
+    model_id = model or AVAILABLE_MODELS[DEFAULT_MODEL]
     try:
         response = client.models.generate_content(
-            model=GEMINI_MODEL,
+            model=model_id,
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -322,7 +323,7 @@ def _extract_json(text: str) -> dict | None:
         return None
 
 
-def run_full_search(client: genai.Client, categories: list[str] = None) -> dict:
+def run_full_search(client: genai.Client, categories: list[str] = None, model: str = None) -> dict:
     """Run searches for all or specified categories."""
     search_functions = {
         "professors_materials": search_professors_materials,
@@ -338,6 +339,6 @@ def run_full_search(client: genai.Client, categories: list[str] = None) -> dict:
     results = {}
     for category in categories:
         if category in search_functions:
-            results[category] = search_functions[category](client)
+            results[category] = search_functions[category](client, model=model)
 
     return results

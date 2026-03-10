@@ -8,7 +8,7 @@ import streamlit as st
 import json
 import time
 from agent import create_client, run_full_search
-from config import SEARCH_CATEGORIES
+from config import SEARCH_CATEGORIES, AVAILABLE_MODELS, DEFAULT_MODEL
 
 # ──────────────── Page Configuration ────────────────
 st.set_page_config(
@@ -630,7 +630,7 @@ st.markdown(
         in AI+Materials Science and Computer Vision — surfacing only the best from QS Top 100 
         universities and Stanford's Top 2% researchers.
     </div>
-    <div class="hero-badge">⚡ POWERED BY GEMINI 2.0 FLASH + GOOGLE SEARCH</div>
+    <div class="hero-badge">⚡ POWERED BY GEMINI + GOOGLE SEARCH</div>
 </div>
 """,
     unsafe_allow_html=True,
@@ -646,6 +646,25 @@ with st.sidebar:
         type="password",
         help="Get your free API key from https://aistudio.google.com/apikey",
         placeholder="Enter your Gemini API key...",
+    )
+
+    st.markdown("### 🤖 Model Selection")
+    selected_model_name = st.selectbox(
+        "Choose Gemini Model",
+        options=list(AVAILABLE_MODELS.keys()),
+        index=list(AVAILABLE_MODELS.keys()).index(DEFAULT_MODEL),
+        help="Gemini 3 Flash is fastest, Gemini 3 Pro gives more detailed results, Gemini 2.0 Flash is the stable fallback.",
+    )
+    selected_model_id = AVAILABLE_MODELS[selected_model_name]
+
+    st.markdown(
+        f"""
+    <div style="background:rgba(102,126,234,0.08);border:1px solid rgba(102,126,234,0.2);border-radius:10px;padding:0.6rem 0.8rem;margin:0.3rem 0 0.8rem;font-size:0.78rem;color:#a8b2d1;">
+        🤖 Using: <strong style="color:#f093fb;">{selected_model_name}</strong><br>
+        <code style="font-size:0.72rem;color:#667eea;">{selected_model_id}</code>
+    </div>
+    """,
+        unsafe_allow_html=True,
     )
 
     st.markdown(
@@ -792,7 +811,7 @@ elif search_clicked and api_key:
                     "internships": search_internships,
                 }
 
-                result = fn_map[category](client)
+                result = fn_map[category](client, model=selected_model_id)
                 all_results[category] = result
 
         progress_bar.progress(1.0, text="✅ Search complete!")
