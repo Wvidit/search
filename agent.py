@@ -8,6 +8,7 @@ Uses Gemini 2.0 Flash (free tier) with Google Search to find:
 
 import json
 import re
+import time
 from google import genai
 from google.genai import types
 from config import AVAILABLE_MODELS, DEFAULT_MODEL, QUALITY_CRITERIA
@@ -256,46 +257,110 @@ Return ONLY valid JSON, no additional text before or after.
     return _execute_search(client, prompt, model)
 
 
-def _execute_search(client: genai.Client, prompt: str, model: str = None) -> dict:
-    """Execute a search query using Gemini with Google Search grounding."""
-    model_id = model or AVAILABLE_MODELS[DEFAULT_MODEL]
-    try:
-        response = client.models.generate_content(
-            model=model_id,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                temperature=0.3,
-            ),
-        )
+def _extract_retry_delay(error_msg: str) -> float:
+    """Extract the retry delay from a rate-limit error message."""
+    match = re.search(r'retry in ([\d.]+)s', error_msg)
+    if match:
+        return float(match.group(1))
+    return 10.0  # default 10s
 
-        # Extract text from response
-        text = response.text
-        if not text:
-            return {"error": "Empty response from Gemini API"}
 
-        # Parse JSON from response
-        parsed = _extract_json(text)
+def _get_fallback_models(primary_model: str) -> list[str]:
+    """Get a list of fallback model IDs, excluding the primary."""
+    all_ids = list(AVAILABLE_MODELS.values())
+    return [m for m in all_ids if m != primary_model]
 
-        # Extract grounding sources if available
-        sources = []
-        if response.candidates and response.candidates[0].grounding_metadata:
-            gm = response.candidates[0].grounding_metadata
-            if gm.grounding_chunks:
-                for chunk in gm.grounding_chunks:
-                    if chunk.web:
-                        sources.append(
-                            {"title": chunk.web.title or "", "url": chunk.web.uri or ""}
+
+def _execute_search(
+    client: genai.Client,
+    prompt: str,
+    model: str = None,
+    max_retries: int = 3,
+    _status_callback=None,
+) -> dict:
+    """Execute a search query using Gemini with Google Search grounding.
+
+    Includes:
+    - Exponential backoff retry on rate-limit (429) errors
+    - Automatic fallback to other models if the selected one is exhausted
+    """
+    primary_model = model or AVAILABLE_MODELS[DEFAULT_MODEL]
+    models_to_try = [primary_model] + _get_fallback_models(primary_model)
+
+    last_error = None
+
+    for model_id in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                if _status_callback:
+                    if attempt > 0:
+                        _status_callback(f"⏳ Retry {attempt}/{max_retries} with {model_id}...")
+                    elif model_id != primary_model:
+                        _status_callback(f"🔄 Falling back to {model_id}...")
+
+                response = client.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                        temperature=0.3,
+                    ),
+                )
+
+                # Extract text from response
+                text = response.text
+                if not text:
+                    return {"error": "Empty response from Gemini API"}
+
+                # Parse JSON from response
+                parsed = _extract_json(text)
+
+                # Extract grounding sources if available
+                sources = []
+                if response.candidates and response.candidates[0].grounding_metadata:
+                    gm = response.candidates[0].grounding_metadata
+                    if gm.grounding_chunks:
+                        for chunk in gm.grounding_chunks:
+                            if chunk.web:
+                                sources.append(
+                                    {"title": chunk.web.title or "", "url": chunk.web.uri or ""}
+                                )
+
+                if parsed:
+                    parsed["_sources"] = sources
+                    parsed["_model_used"] = model_id
+                    return parsed
+                else:
+                    return {"error": "Could not parse response", "raw_text": text[:2000]}
+
+            except Exception as e:
+                error_str = str(e)
+                last_error = error_str
+
+                # Check if it's a rate-limit (429) error
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    retry_delay = _extract_retry_delay(error_str)
+                    # Exponential backoff: base delay * 2^attempt
+                    wait_time = max(retry_delay, 10.0) * (2 ** attempt)
+                    # Cap at 60 seconds
+                    wait_time = min(wait_time, 60.0)
+
+                    if _status_callback:
+                        _status_callback(
+                            f"⚠️ Rate limited on {model_id}. Waiting {wait_time:.0f}s before retry {attempt+1}/{max_retries}..."
                         )
 
-        if parsed:
-            parsed["_sources"] = sources
-            return parsed
-        else:
-            return {"error": "Could not parse response", "raw_text": text[:2000]}
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Non-rate-limit error, don't retry
+                    return {"error": error_str}
 
-    except Exception as e:
-        return {"error": str(e)}
+        # If all retries exhausted for this model, try next model
+        if _status_callback:
+            _status_callback(f"❌ {model_id} exhausted. Trying next model...")
+
+    return {"error": f"All models exhausted after retries. Last error: {last_error}"}
 
 
 def _extract_json(text: str) -> dict | None:
@@ -323,8 +388,17 @@ def _extract_json(text: str) -> dict | None:
         return None
 
 
-def run_full_search(client: genai.Client, categories: list[str] = None, model: str = None) -> dict:
-    """Run searches for all or specified categories."""
+# Delay between searches to avoid hitting per-minute rate limits (seconds)
+SEARCH_DELAY = 12
+
+
+def run_full_search(
+    client: genai.Client,
+    categories: list[str] = None,
+    model: str = None,
+    status_callback=None,
+) -> dict:
+    """Run searches for all or specified categories with inter-search delays."""
     search_functions = {
         "professors_materials": search_professors_materials,
         "professors_cv": search_professors_cv,
@@ -337,8 +411,13 @@ def run_full_search(client: genai.Client, categories: list[str] = None, model: s
         categories = list(search_functions.keys())
 
     results = {}
-    for category in categories:
+    for i, category in enumerate(categories):
         if category in search_functions:
             results[category] = search_functions[category](client, model=model)
+            # Add delay between searches to stay under rate limits
+            if i < len(categories) - 1:
+                if status_callback:
+                    status_callback(f"⏳ Cooling down {SEARCH_DELAY}s to avoid rate limits...")
+                time.sleep(SEARCH_DELAY)
 
     return results

@@ -786,6 +786,24 @@ elif search_clicked and api_key:
         # Progress tracking
         total = len(selected_categories)
         progress_bar = st.progress(0, text="Initializing search agent...")
+        status_placeholder = st.empty()
+
+        from agent import (
+            search_professors_materials,
+            search_professors_cv,
+            search_phd_students,
+            search_labs,
+            search_internships,
+            SEARCH_DELAY,
+        )
+
+        fn_map = {
+            "professors_materials": search_professors_materials,
+            "professors_cv": search_professors_cv,
+            "phd_students": search_phd_students,
+            "labs": search_labs,
+            "internships": search_internships,
+        }
 
         for i, category in enumerate(selected_categories):
             label = category_labels.get(category, category)
@@ -795,28 +813,26 @@ elif search_clicked and api_key:
             )
 
             with st.spinner(f"🌐 Agent is surfing the web for {label}..."):
-                from agent import (
-                    search_professors_materials,
-                    search_professors_cv,
-                    search_phd_students,
-                    search_labs,
-                    search_internships,
-                )
-
-                fn_map = {
-                    "professors_materials": search_professors_materials,
-                    "professors_cv": search_professors_cv,
-                    "phd_students": search_phd_students,
-                    "labs": search_labs,
-                    "internships": search_internships,
-                }
-
                 result = fn_map[category](client, model=selected_model_id)
                 all_results[category] = result
+
+                # Show which model was actually used (may differ if fallback happened)
+                model_used = result.get("_model_used", selected_model_id)
+                if model_used != selected_model_id and "error" not in result:
+                    status_placeholder.info(f"ℹ️ {label} was fetched using fallback model: **{model_used}**")
+
+            # Cooldown between searches to avoid rate limits
+            if i < len(selected_categories) - 1:
+                progress_bar.progress(
+                    (i + 0.5) / total,
+                    text=f"⏳ Cooling down {SEARCH_DELAY}s to stay under rate limits...",
+                )
+                time.sleep(SEARCH_DELAY)
 
         progress_bar.progress(1.0, text="✅ Search complete!")
         time.sleep(0.5)
         progress_bar.empty()
+        status_placeholder.empty()
 
         # Store results in session
         st.session_state["results"] = all_results
